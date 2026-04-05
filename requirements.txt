@@ -1,7 +1,7 @@
 flask==3.0.3
 gunicorn==22.0.0
 scikit-learn
-pandas==2.2.2
-numpy==1.26.4
+pandas
+numpy
 requests==2.32.3
 schedule==1.2.2
