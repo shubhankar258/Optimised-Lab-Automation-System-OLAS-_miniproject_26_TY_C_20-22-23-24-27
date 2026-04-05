@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: aura-lab-automation
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 2 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: RAINMAKER_NODE_ID
+        sync: false
+      - key: RAINMAKER_TOKEN
+        sync: false

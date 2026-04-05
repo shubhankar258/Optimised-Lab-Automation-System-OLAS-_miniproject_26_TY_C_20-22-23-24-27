@@ -1,0 +1,7 @@
+flask==3.0.3
+gunicorn==22.0.0
+scikit-learn==1.4.2
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3
+schedule==1.2.2
