@@ -1,4 +1,4 @@
-# AURA — Adaptive Usage-based Relay Automation (2026)
+# Optimised Lab Automation System (2026)
 
 ## Files needed in this folder
 - app.py           ← Flask scheduler (this file)
