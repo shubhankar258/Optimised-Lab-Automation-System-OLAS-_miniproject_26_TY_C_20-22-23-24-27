@@ -876,7 +876,7 @@ automation_enabled = True
 @app.route('/toggle_automation', methods=['POST'])
 def toggle_automation():
     global automation_enabled
-    data = request.get_json()
+    data = requests.get_json()
     automation_enabled = data.get('enabled', True)
     log.info(f"ML Automation toggled: {'ON' if automation_enabled else 'OFF'}")
     return jsonify({"automation_enabled": automation_enabled})
