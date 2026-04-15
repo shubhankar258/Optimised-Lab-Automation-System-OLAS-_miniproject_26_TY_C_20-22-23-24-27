@@ -16,6 +16,12 @@ import time
 import os
 import logging
 
+
+import pytz  # Add this import
+
+# Set timezone to IST
+IST = pytz.timezone('Asia/Kolkata')
+
 # ── Logging setup ────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -158,7 +164,7 @@ def current_session(dt: datetime.datetime) -> str:
 
 # ── Core: predict → compare → send to RainMaker ──────────────
 def predict_and_control(source: str = "scheduler"):
-    now     = datetime.datetime.now()
+    now     = datetime.datetime.now(IST)
     feats   = build_features(now)
     session = current_session(now)
 
@@ -857,7 +863,7 @@ def predict_time(hour, minute, dow):
     /predict_time/17/0/0   → Monday 17:00  (Outside)
     dow: 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri 5=Sat 6=Sun
     """
-    dt    = datetime.datetime.now().replace(hour=hour, minute=minute)
+    dt    = datetime.datetime.now(IST).replace(hour=hour, minute=minute)
     feats = build_features(dt)
     preds = {}
     for sw in SWITCHES:
