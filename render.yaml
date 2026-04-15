@@ -1,11 +1,19 @@
 services:
   - type: web
-    name: aura-lab-automation
+    name: olas-lab-automation
     runtime: python
+    region: singapore
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 1 --threads 2 --bind 0.0.0.0:$PORT
+    startCommand: gunicorn app:app --workers 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT
     envVars:
       - key: RAINMAKER_NODE_ID
         sync: false
-      - key: RAINMAKER_TOKEN
+      - key: RAINMAKER_EMAIL
         sync: false
+      - key: RAINMAKER_PASSWORD
+        sync: false
+      - key: TZ
+        value: Asia/Kolkata
+      - key: PYTHON_VERSION
+        value: 3.11.9
