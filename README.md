@@ -62,14 +62,11 @@ OLAS is an IoT + Machine Learning based smart lab lighting system. It uses an ES
 - <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/8588ae95-003e-4a7b-9cf2-2df94caf826c" />
  
 - RainMaker App
-- <img width="575" height="1280" alt="WhatsApp Image 2026-04-15 at 12 13 58 PM" src="https://github.com/user-attachments/assets/af7c6ea4-c236-499f-8056-cdee819251be" />
+- <img src="https://github.com/user-attachments/assets/af7c6ea4-c236-499f-8056-cdee819251be" width="350" />
  
 - Google Home Integration
-- <img width="575" height="1280" alt="WhatsApp Image 2026-04-15 at 12 13 55 PM" src="https://github.com/user-attachments/assets/e96bed71-9fa8-46e6-a4d7-7a7ecb8c84a6" />
+- <img src="https://github.com/user-attachments/assets/e96bed71-9fa8-46e6-a4d7-7a7ecb8c84a6" width="350"/>
 
 
 ---
 
-
-
-## ⭐ Star this repo if you like it!
