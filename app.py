@@ -1,6 +1,6 @@
 # ============================================================
 #  OLAS — Optimised Lab Automation System
-#  Flask Scheduler  |  Deploy on Render.com (free tier)
+#  Flask Scheduler + Live State Fetch | Deploy on Render.com
 #  Year: 2026
 # ============================================================
 
@@ -15,9 +15,7 @@ import threading
 import time
 import os
 import logging
-
-
-import pytz  # Add this import
+import pytz
 
 # Set timezone to IST
 IST = pytz.timezone('Asia/Kolkata')
@@ -53,6 +51,9 @@ _token_cache = {
     "fetched_at"   : 0
 }
 
+# Global variable to store actual states fetched from RainMaker
+actual_states = {sw: False for sw in SWITCHES}
+
 def login_and_get_tokens():
     """
     Full login using email + password via /v1/login2.
@@ -77,10 +78,6 @@ def login_and_get_tokens():
 def get_access_token() -> str:
     """
     Returns a valid access token.
-    - If token is fresh (< 50 min old) → returns cached token
-    - If token is stale → tries silent refresh via Cognito
-    - If refresh fails → does full re-login with email + password
-    Access tokens last ~60 min. We refresh at 50 min to stay safe.
     """
     now = time.time()
     age = now - _token_cache["fetched_at"]
@@ -115,13 +112,39 @@ def get_access_token() -> str:
 
     return _token_cache["access_token"]
 
+# ── Fetch actual states from RainMaker ───────────────────────
+def fetch_actual_states():
+    """Fetch current switch states from RainMaker cloud"""
+    global actual_states
+    try:
+        headers = {"Authorization": f"Bearer {get_access_token()}"}
+        resp = requests.get(
+            f"{API_URL}?node_id={NODE_ID}",
+            headers=headers,
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for sw in SWITCHES:
+                if sw in data:
+                    state = data[sw].get("Power", data[sw].get("output", False))
+                    actual_states[sw] = bool(state)
+            log.info(f"Actual states fetched: {actual_states}")
+            return True
+        else:
+            log.warning(f"Failed to fetch states: {resp.status_code}")
+            return False
+    except Exception as e:
+        log.error(f"Error fetching states: {e}")
+        return False
+
 # ── Login on startup ──────────────────────────────────────────
 if RM_EMAIL != "your@email.com":
     try:
         login_and_get_tokens()
+        fetch_actual_states()
     except Exception as e:
         log.error(f"Startup login failed: {e}")
-        log.warning("Scheduler will retry login on first prediction attempt")
 
 # ── Load model ───────────────────────────────────────────────
 log.info("Loading lab_model.pkl ...")
@@ -162,11 +185,15 @@ def current_session(dt: datetime.datetime) -> str:
         return "Sunday — no college"
     return "Outside session hours"
 
-# ── Core: predict → compare → send to RainMaker ──────────────
-def predict_and_control(source: str = "scheduler"):
-    now     = datetime.datetime.now(IST)
-    feats   = build_features(now)
+# ── Core: predict and compare (NO automation commands) ───────
+def predict_and_compare(source: str = "scheduler"):
+    """Run ML prediction and compare with actual states (no commands sent)"""
+    now = datetime.datetime.now(IST)
+    feats = build_features(now)
     session = current_session(now)
+
+    # Fetch latest actual states
+    fetch_success = fetch_actual_states()
 
     # Run all 4 classifiers
     predictions = {}
@@ -174,75 +201,49 @@ def predict_and_control(source: str = "scheduler"):
         pred = int(models[sw].predict(feats)[0])
         prob = models[sw].predict_proba(feats)[0][pred]
         predictions[sw] = {
-            "state"     : bool(pred),
+            "state": bool(pred),
             "confidence": round(float(prob), 3)
         }
 
-    # Build RainMaker payload — "Power" matches write_callback in ESP32 firmware
-    payload = [
-    {
-        "node_id": NODE_ID,
-        "payload": {
-            sw: {
-                "output": predictions[sw]["state"]
-            }
-            for sw in SWITCHES
+    # Compare actual vs predicted
+    comparison = {}
+    for sw in SWITCHES:
+        actual = actual_states.get(sw, False)
+        predicted = predictions[sw]["state"]
+        comparison[sw] = {
+            "actual": actual,
+            "predicted": predicted,
+            "match": actual == predicted,
+            "confidence": predictions[sw]["confidence"]
         }
-    }
-]
 
-    api_status = "not_sent"
-
-    if RM_EMAIL != "your@email.com":
-        try:
-            # Always fetch a fresh (or cached) token — never hardcoded
-            fresh_headers = {
-                "Authorization": f"Bearer {get_access_token()}",
-                "Content-Type" : "application/json"
-            }
-            r = requests.put(
-                API_URL,
-                headers=fresh_headers,
-                json=payload,
-                timeout=10
-            )
-            api_status = "ok" if r.status_code == 200 else f"error_{r.status_code}"
-            if r.status_code == 200:
-                log.info(f"Commands sent OK  |  {session}")
-            else:
-                log.warning(f"API returned {r.status_code}: {r.text[:120]}")
-        except Exception as e:
-            api_status = "connection_error"
-            log.error(f"API call failed: {e}")
-    else:
-        api_status = "credentials_not_set"
-        log.warning("RAINMAKER_EMAIL not configured — running in preview mode")
+    api_status = "states_fetched" if fetch_success else "fetch_failed"
 
     # Store entry in memory log
     entry = {
-        "timestamp"  : now.strftime("%Y-%m-%d %H:%M:%S"),
-        "session"    : session,
-        "source"     : source,
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "session": session,
+        "source": source,
         "predictions": predictions,
-        "api_status" : api_status,
+        "actual_states": actual_states.copy(),
+        "comparison": comparison,
+        "api_status": api_status,
     }
     prediction_log.insert(0, entry)
     if len(prediction_log) > 50:
         prediction_log.pop()
 
-    states_str = "  ".join([
-        f"{sw}: {'ON ' if predictions[sw]['state'] else 'OFF'}"
-        for sw in SWITCHES
-    ])
-    log.info(f"[{source}]  {states_str}  |  API: {api_status}")
+    # Log summary
+    matches = sum(1 for sw in SWITCHES if comparison[sw]["match"])
+    log.info(f"[{source}] Match: {matches}/4 | Fetch: {api_status}")
     return entry
 
-# ── Scheduler thread ─────────────────────────────────────────
-schedule.every(30).minutes.do(lambda: predict_and_control("scheduler"))
+# ── Scheduler thread (only fetches and compares, no commands) ─
+schedule.every(30).minutes.do(lambda: predict_and_compare("scheduler"))
 
 def run_scheduler():
-    log.info("Scheduler started — firing every 30 minutes")
-    predict_and_control("startup")
+    log.info("Scheduler started — fetching states & comparing every 30 minutes")
+    predict_and_compare("startup")
     while True:
         schedule.run_pending()
         time.sleep(30)
@@ -250,7 +251,7 @@ def run_scheduler():
 scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
 scheduler_thread.start()
 
-# ── Dashboard HTML (OLAS Iron Man theme) ─────────────────────
+# ── Dashboard HTML (Updated with Actual vs Predicted) ────────
 DASHBOARD = """
 <!DOCTYPE html>
 <html lang="en">
@@ -273,7 +274,8 @@ DASHBOARD = """
       --accent: #0066ff;
       --accent-soft: #e0ebff;
       --success: #00b87a;
-      --shadow-sm: 0 2px 8px rgba(0,0,0,0.04);
+      --warning: #f59e0b;
+      --danger: #ef4444;
       --shadow-md: 0 8px 20px rgba(0,0,0,0.06);
     }
 
@@ -287,8 +289,6 @@ DASHBOARD = """
       --accent: #3399ff;
       --accent-soft: #1a2a3a;
       --success: #00cc88;
-      --shadow-sm: 0 2px 8px rgba(0,0,0,0.3);
-      --shadow-md: 0 8px 24px rgba(0,0,0,0.4);
     }
 
     body {
@@ -300,7 +300,7 @@ DASHBOARD = """
 
     .dashboard { max-width: 1200px; margin: 0 auto; }
 
-    /* ----- TOP NAVIGATION BAR (clean, minimal) ----- */
+    /* Top Nav */
     .top-nav {
       display: flex;
       justify-content: space-between;
@@ -317,7 +317,6 @@ DASHBOARD = """
       -webkit-background-clip: text;
       background-clip: text;
       color: transparent;
-      letter-spacing: -0.5px;
     }
 
     .nav-controls {
@@ -357,7 +356,6 @@ DASHBOARD = """
       background: var(--accent-soft);
       padding: 8px 18px;
       border-radius: 40px;
-      border: 1px solid var(--border-light);
     }
 
     .pulse-dot {
@@ -365,47 +363,40 @@ DASHBOARD = """
       height: 10px;
       border-radius: 50%;
       background: var(--success);
-      box-shadow: 0 0 6px var(--success);
       animation: pulse 1.8s infinite;
-    }
-
-    .status-text {
-      font-weight: 500;
-      font-size: 0.9rem;
-      color: var(--accent);
     }
 
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
 
-    /* ----- Device Grid ----- */
+    /* Comparison Grid */
     .section-title {
       font-size: 1.2rem;
       font-weight: 600;
       margin: 24px 0 16px;
-      color: var(--text-primary);
     }
 
-    .device-grid {
+    .comparison-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
       gap: 20px;
     }
 
-    .device-card {
+    .comparison-card {
       background: var(--card-bg);
       border-radius: 24px;
-      padding: 24px 16px 20px;
+      padding: 20px 16px;
       box-shadow: var(--shadow-md);
-      border: 1px solid var(--border-light);
+      border: 2px solid var(--border-light);
       text-align: center;
-      transition: transform 0.2s;
     }
 
-    .device-card:hover { transform: translateY(-4px); }
+    .comparison-card.match {
+      border-color: var(--success);
+      background: linear-gradient(145deg, var(--card-bg), var(--accent-soft));
+    }
 
-    .device-icon {
-      font-size: 36px;
-      margin-bottom: 12px;
+    .comparison-card.mismatch {
+      border-color: var(--warning);
     }
 
     .device-name {
@@ -414,46 +405,57 @@ DASHBOARD = """
       margin-bottom: 16px;
     }
 
-    .device-state {
-      display: inline-block;
-      padding: 6px 20px;
-      border-radius: 40px;
-      font-weight: 600;
-      font-size: 0.9rem;
-      margin-bottom: 16px;
+    .state-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border-light);
     }
 
-    .state-on {
+    .state-row .label {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+    }
+
+    .state-row .value {
+      font-weight: 600;
+    }
+
+    .value.on { color: var(--success); }
+    .value.off { color: var(--text-muted); }
+
+    .match-status {
+      margin-top: 12px;
+      padding: 6px;
+      border-radius: 20px;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+
+    .match .match-status {
       background: var(--success);
       color: white;
     }
 
-    .state-off {
-      background: var(--border-light);
-      color: var(--text-secondary);
+    .mismatch .match-status {
+      background: var(--warning);
+      color: white;
     }
 
-    .confidence-meter {
-      width: 100%;
-      height: 4px;
-      background: var(--border-light);
-      border-radius: 4px;
-      overflow: hidden;
+    .action-needed {
+      margin-top: 8px;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-style: italic;
     }
 
-    .confidence-fill {
-      height: 100%;
-      background: var(--accent);
-      border-radius: 4px;
-    }
-
-    .confidence-label {
+    .confidence {
+      margin-top: 8px;
       font-size: 0.75rem;
       color: var(--text-muted);
-      margin-top: 8px;
     }
 
-    /* ----- Automation Card ----- */
+    /* Cards */
     .automation-card {
       background: var(--card-bg);
       border-radius: 24px;
@@ -468,57 +470,29 @@ DASHBOARD = """
       gap: 20px;
     }
 
-    .automation-left h3 {
-      font-size: 1.2rem;
-      margin-bottom: 6px;
-    }
-
-    .automation-left p {
-      color: var(--text-muted);
-      font-size: 0.9rem;
-    }
-
-    .automation-controls {
-      display: flex;
-      align-items: center;
-      gap: 20px;
-    }
-
-    .toggle-switch {
-      position: relative;
-      width: 56px;
-      height: 30px;
-      background: var(--border-light);
-      border-radius: 40px;
-      cursor: pointer;
-      transition: 0.2s;
-    }
-
-    .toggle-switch.active {
+    .btn {
       background: var(--accent);
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 40px;
+      font-weight: 600;
+      cursor: pointer;
     }
 
-    .toggle-slider {
-      position: absolute;
-      top: 3px;
-      left: 3px;
-      width: 24px;
-      height: 24px;
-      background: white;
-      border-radius: 50%;
-      transition: 0.2s;
+    .btn-outline {
+      background: transparent;
+      border: 1px solid var(--border-light);
+      color: var(--text-primary);
     }
 
-    .active .toggle-slider { left: 29px; }
-
-    /* ----- Manual Check Section ----- */
+    /* Manual Section */
     .manual-section {
       background: var(--card-bg);
       border-radius: 24px;
       padding: 24px;
       margin-bottom: 28px;
       border: 1px solid var(--border-light);
-      box-shadow: var(--shadow-md);
     }
 
     .manual-form {
@@ -551,23 +525,6 @@ DASHBOARD = """
       width: 120px;
     }
 
-    .btn {
-      background: var(--accent);
-      color: white;
-      border: none;
-      padding: 12px 24px;
-      border-radius: 40px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: 0.2s;
-    }
-
-    .btn-outline {
-      background: transparent;
-      border: 1px solid var(--border-light);
-      color: var(--text-primary);
-    }
-
     .prediction-preview {
       margin-top: 24px;
       display: flex;
@@ -581,16 +538,12 @@ DASHBOARD = """
       border-radius: 20px;
     }
 
-    .preview-item .label { color: var(--text-muted); font-size: 0.85rem; }
-    .preview-item .value { font-size: 1.8rem; font-weight: 700; }
-
-    /* ----- Activity Log Feed ----- */
+    /* Log Feed */
     .log-feed {
       background: var(--card-bg);
       border-radius: 24px;
       padding: 20px;
       border: 1px solid var(--border-light);
-      box-shadow: var(--shadow-md);
     }
 
     .log-item {
@@ -600,57 +553,20 @@ DASHBOARD = """
       border-bottom: 1px solid var(--border-light);
     }
 
-    .log-time {
-      min-width: 140px;
-      color: var(--text-muted);
-      font-size: 0.85rem;
-    }
-
-    .log-switches {
-      display: flex;
-      gap: 16px;
-      margin: 0 20px;
-    }
-
-    .log-switch {
-      font-weight: 600;
-      font-size: 0.9rem;
-    }
-
-    .state-on { color: var(--success); }
-    .state-off { color: var(--text-muted); }
-
-    .log-session {
-      color: var(--text-secondary);
-      font-size: 0.85rem;
-      margin-left: auto;
-    }
-
-    .status-tag {
-      padding: 4px 10px;
-      border-radius: 40px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      background: var(--accent-soft);
-      color: var(--accent);
-      margin-left: 16px;
-    }
+    .log-time { min-width: 140px; color: var(--text-muted); font-size: 0.85rem; }
 
     @media (max-width: 800px) {
-      .device-grid { grid-template-columns: repeat(2, 1fr); }
-      .top-nav { flex-direction: column; align-items: flex-start; }
+      .comparison-grid { grid-template-columns: repeat(2, 1fr); }
     }
 
     @media (max-width: 500px) {
-      .device-grid { grid-template-columns: 1fr; }
-      .automation-card { flex-direction: column; align-items: flex-start; }
-      .nav-controls { flex-wrap: wrap; }
+      .comparison-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
 <div class="dashboard">
-  <!-- TOP NAVIGATION BAR: OLAS | Theme Toggle | System Status -->
+  <!-- Top Nav -->
   <div class="top-nav">
     <div class="project-name">OLAS</div>
     <div class="nav-controls">
@@ -660,32 +576,27 @@ DASHBOARD = """
       </div>
       <div class="status-badge">
         <span class="pulse-dot"></span>
-        <span class="status-text">System Online · RainMaker</span>
+        <span class="status-text">Live · RainMaker</span>
       </div>
     </div>
   </div>
 
-  <!-- DEVICE GRID -->
-  <div class="section-title">🔌 Connected Devices</div>
-  <div class="device-grid" id="deviceGrid">
+  <!-- COMPARISON GRID: Actual vs Predicted -->
+  <div class="section-title">📊 Actual vs Predicted Comparison</div>
+  <div class="comparison-grid" id="comparisonGrid">
     <!-- Populated by JS -->
   </div>
 
-  <!-- ML AUTOMATION CARD -->
+  <!-- Action Card -->
   <div class="automation-card">
-    <div class="automation-left">
-      <h3>🤖 ML Automation</h3>
-      <p>Predictive control based on lab schedule</p>
+    <div>
+      <h3>🤖 ML Intelligence</h3>
+      <p style="color: var(--text-muted);">Predictions compared with live states · Automation documented as future scope</p>
     </div>
-    <div class="automation-controls">
-      <div class="toggle-switch active" id="automationToggle">
-        <div class="toggle-slider"></div>
-      </div>
-      <button class="btn btn-outline" id="runNowBtn">▶ Run Now</button>
-    </div>
+    <button class="btn" id="refreshBtn">⟳ Fetch & Predict</button>
   </div>
 
-  <!-- MANUAL MODEL CHECK -->
+  <!-- Manual Model Check -->
   <div class="manual-section">
     <h3>🧪 Manual Model Check</h3>
     <div class="manual-form">
@@ -709,7 +620,7 @@ DASHBOARD = """
     <div id="manualPredictionOutput" class="prediction-preview"></div>
   </div>
 
-  <!-- ACTIVITY LOG FEED -->
+  <!-- Activity Log -->
   <div class="log-feed">
     <h3 style="margin-bottom: 16px;">📋 Recent Activity</h3>
     <div id="logFeedContainer"></div>
@@ -717,38 +628,54 @@ DASHBOARD = """
 </div>
 
 <script>
-  // ---------- Theme ----------
   function setTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
     document.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
     document.querySelector(`[data-theme="${t}"]`).classList.add('active');
     localStorage.setItem('olas-theme', t);
   }
-  const saved = localStorage.getItem('olas-theme') || 'light';
-  setTheme(saved);
+  setTheme(localStorage.getItem('olas-theme') || 'light');
 
   const switches = ['Switch1','Switch2','Switch3','Switch4'];
   const initialLogs = {{ logs | tojson if logs else [] }};
-  let automationEnabled = true;
 
-  function renderDevices(logs) {
-    const grid = document.getElementById('deviceGrid');
+  function renderComparison(logs) {
+    const grid = document.getElementById('comparisonGrid');
     if (!logs.length) {
-      grid.innerHTML = '<div style="grid-column:span 4; text-align:center; padding:40px; color:var(--text-muted);">No data yet</div>';
+      grid.innerHTML = '<div style="grid-column:span 4; text-align:center; padding:40px;">No data yet</div>';
       return;
     }
     const last = logs[0];
     let html = '';
     switches.forEach(sw => {
-      const pred = last.predictions[sw];
-      const on = pred.state;
-      const conf = Math.round(pred.confidence*100);
-      html += `<div class="device-card">
-        <div class="device-icon">💡</div>
+      const comp = last.comparison?.[sw] || {
+        actual: false,
+        predicted: last.predictions[sw].state,
+        match: false,
+        confidence: last.predictions[sw].confidence
+      };
+      const actual = comp.actual;
+      const predicted = comp.predicted;
+      const match = comp.match;
+      const conf = Math.round(comp.confidence * 100);
+      
+      html += `<div class="comparison-card ${match ? 'match' : 'mismatch'}">
         <div class="device-name">${sw}</div>
-        <div class="device-state ${on ? 'state-on' : 'state-off'}">${on ? 'ON' : 'OFF'}</div>
-        <div class="confidence-meter"><div class="confidence-fill" style="width:${conf}%"></div></div>
-        <div class="confidence-label">${conf}% confidence</div>
+        <div class="state-row">
+          <span class="label">Actual:</span>
+          <span class="value ${actual ? 'on' : 'off'}">${actual ? 'ON' : 'OFF'}</span>
+        </div>
+        <div class="state-row">
+          <span class="label">Predicted:</span>
+          <span class="value ${predicted ? 'on' : 'off'}">${predicted ? 'ON' : 'OFF'}</span>
+        </div>
+        <div class="match-status">${match ? '✅ Match' : '⚠️ Mismatch'}</div>`;
+      
+      if (!match) {
+        html += `<div class="action-needed">Would ${predicted ? 'turn ON' : 'turn OFF'}</div>`;
+      }
+      
+      html += `<div class="confidence">${conf}% confidence</div>
       </div>`;
     });
     grid.innerHTML = html;
@@ -757,17 +684,17 @@ DASHBOARD = """
   function renderLogs(logs) {
     const container = document.getElementById('logFeedContainer');
     if (!logs.length) {
-      container.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted);">No activity yet</div>';
+      container.innerHTML = '<div style="padding:20px; text-align:center;">No logs</div>';
       return;
     }
     let items = '';
     logs.slice(0,8).forEach(entry => {
-      const states = switches.map(sw => `<span class="log-switch ${entry.predictions[sw].state ? 'state-on' : 'state-off'}">${sw.slice(-1)}:${entry.predictions[sw].state?'ON':'OFF'}</span>`).join('');
+      const matches = entry.comparison ? 
+        Object.values(entry.comparison).filter(c => c.match).length : 0;
       items += `<div class="log-item">
         <span class="log-time">${entry.timestamp}</span>
-        <div class="log-switches">${states}</div>
-        <span class="log-session">${entry.session}</span>
-        <span class="status-tag">${entry.api_status}</span>
+        <span>Match: ${matches}/4 · ${entry.session}</span>
+        <span style="margin-left: auto;">${entry.api_status}</span>
       </div>`;
     });
     container.innerHTML = items;
@@ -786,38 +713,32 @@ DASHBOARD = """
       let html = `<div><strong>${data.query}</strong> · ${data.session}</div><div style="display:flex; gap:20px; margin-top:12px;">`;
       switches.forEach(sw => {
         const p = data.predictions[sw];
-        html += `<div class="preview-item"><span class="label">${sw}</span><div class="value">${p.state?'ON':'OFF'}</div><small>${Math.round(p.confidence*100)}%</small></div>`;
+        html += `<div class="preview-item"><span>${sw}</span><div style="font-size:1.5rem; font-weight:700;">${p.state?'ON':'OFF'}</div><small>${Math.round(p.confidence*100)}%</small></div>`;
       });
       html += '</div>';
       out.innerHTML = html;
     } catch(e) {
-      out.innerHTML = '<p style="color:red;">Prediction failed</p>';
+      out.innerHTML = '<p style="color:red;">Failed</p>';
     }
   });
 
-  // Run now
-  document.getElementById('runNowBtn').addEventListener('click', async (e) => {
-    const btn = e.target;
+  // Refresh button
+  document.getElementById('refreshBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('refreshBtn');
     btn.disabled = true;
-    btn.textContent = 'Running...';
+    btn.textContent = 'Fetching...';
     try {
       await fetch('/trigger');
       setTimeout(() => location.reload(), 500);
     } catch {
       alert('Failed');
       btn.disabled = false;
-      btn.textContent = '▶ Run Now';
+      btn.textContent = '⟳ Fetch & Predict';
     }
   });
 
-  // Automation toggle
-  document.getElementById('automationToggle').addEventListener('click', function() {
-    automationEnabled = !automationEnabled;
-    this.classList.toggle('active', automationEnabled);
-  });
-
   // Initialize
-  renderDevices(initialLogs);
+  renderComparison(initialLogs);
   renderLogs(initialLogs);
 </script>
 </body>
@@ -833,59 +754,41 @@ def dashboard():
 def status():
     last = prediction_log[0] if prediction_log else None
     return jsonify({
-        "project"     : "OLAS 2026",
-        "status"      : "running",
-        "scheduler"   : "active — every 30 min",
-        "node_id"     : NODE_ID[:8] + "..." if len(NODE_ID) > 8 else NODE_ID,
-        "last_run"    : last["timestamp"] if last else None,
-        "last_session": last["session"]   if last else None,
-        "token_age_s" : round(time.time() - _token_cache["fetched_at"]) if _token_cache["fetched_at"] else None,
+        "project": "OLAS 2026",
+        "status": "running",
+        "scheduler": "active — every 30 min (fetch & compare only)",
+        "node_id": NODE_ID[:8] + "..." if len(NODE_ID) > 8 else NODE_ID,
+        "actual_states": actual_states,
+        "last_run": last["timestamp"] if last else None,
+        "last_session": last["session"] if last else None,
     })
 
 @app.route("/trigger", methods=["GET", "POST"])
 def trigger():
-    entry = predict_and_control("manual_trigger")
+    entry = predict_and_compare("manual_trigger")
     return jsonify({
-        "message"    : "Prediction triggered",
-        "timestamp"  : entry["timestamp"],
-        "session"    : entry["session"],
+        "message": "States fetched & prediction completed",
+        "timestamp": entry["timestamp"],
+        "session": entry["session"],
+        "actual_states": entry["actual_states"],
         "predictions": entry["predictions"],
-        "api_status" : entry["api_status"],
+        "comparison": entry["comparison"],
     })
 
 @app.route("/predict_time/<int:hour>/<int:minute>/<int:dow>")
 def predict_time(hour, minute, dow):
-    """
-    Test prediction for any time without sending to ESP32.
-    /predict_time/9/30/0   → Monday 9:30   (Session 1)
-    /predict_time/12/0/1   → Tuesday 12:00 (Session 2)
-    /predict_time/14/15/2  → Wednesday 14:15 (Session 3)
-    /predict_time/17/0/0   → Monday 17:00  (Outside)
-    dow: 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri 5=Sat 6=Sun
-    """
-    dt    = datetime.datetime.now(IST).replace(hour=hour, minute=minute)
+    dt = datetime.datetime.now(IST).replace(hour=hour, minute=minute)
     feats = build_features(dt)
     preds = {}
     for sw in SWITCHES:
         state = int(models[sw].predict(feats)[0])
-        prob  = models[sw].predict_proba(feats)[0][state]
+        prob = models[sw].predict_proba(feats)[0][state]
         preds[sw] = {"state": bool(state), "confidence": round(float(prob), 3)}
     return jsonify({
-        "query"      : f"{hour:02d}:{minute:02d}  day_of_week={dow}",
-        "session"    : current_session(dt),
+        "query": f"{hour:02d}:{minute:02d}  day_of_week={dow}",
+        "session": current_session(dt),
         "predictions": preds
     })
-
-# Add near the top of app.py
-automation_enabled = True
-
-@app.route('/toggle_automation', methods=['POST'])
-def toggle_automation():
-    global automation_enabled
-    data = requests.get_json()
-    automation_enabled = data.get('enabled', True)
-    log.info(f"ML Automation toggled: {'ON' if automation_enabled else 'OFF'}")
-    return jsonify({"automation_enabled": automation_enabled})
 
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
